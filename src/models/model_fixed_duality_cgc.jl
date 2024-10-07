@@ -1,6 +1,6 @@
 # Note: See their supplementary material for details
 
-function model_fixed_duality(optimizer, auxdata)
+function model_fixed_duality_cgc(optimizer, auxdata)
     # Extract parameters
     param = auxdata.param
     graph = auxdata.graph
@@ -36,32 +36,33 @@ function model_fixed_duality(optimizer, auxdata)
     @variable(model, kappa_ex[i = 1:graph.ndeg] in Parameter(i), container=Array)
     set_parameter_value.(kappa_ex, kappa_ex_init)
 
-    # Calculate price of consumption bundle PCj
-    @expression(model, PCj[j=1:graph.J], sum(Pjn[j, n]^(1-sigma) for n=1:param.N)^(1/(1-sigma)))
-    # Calculate paer-capita consumption cj
+    # Calculate aggregate price P^D(j)
+    @expression(model, PDj[j=1:graph.J], sum(Pjn[j, n]^(1-sigma) for n=1:param.N)^(1/(1-sigma)))
+
+    # Calculate consumption cj
     @expression(model, cj[j=1:graph.J],
-        alpha * (PCj[j] / omegaj[j])^(-1/(1+alpha*(rho-1))) * hj1malpha[j]^(-((rho-1)/(1+alpha*(rho-1))))
+        alpha * (PDj[j] / omegaj[j])^(-1/(1+alpha*(rho-1))) * hj1malpha[j]^(-((rho-1)/(1+alpha*(rho-1))))
     )
     # Utility per worker in location j
     @expression(model, uj[j=1:graph.J], ((cj[j]/alpha)^alpha * hj1malpha[j])^(1-rho)/(1-rho))
     # zeta (auxiliarly variable)
     zeta = @expression(model, [j=1:graph.J], omegaj[j] * uj[j] * (1-rho) * alpha / cj[j])
-    # Calculate consumption C(j,n)
-    @expression(model, Cjn[j=1:graph.J, n=1:param.N], (Pjn[j, n] / zeta[j])^(-sigma) * cj[j] * Lj[j])
 
-    # No cross-good congestion: Eq. 11 in the main paper
-    # Calculate Q, Qin_direct and Qin_indirect
+    # cross-good congestion: Eq. 11 in the main paper
+    # Calculate Q, Qi_direct and Qi_indirect
     # F&S: Condition (8) implies that goods in each sector flow in only one direction, although a link may have flows in opposite directions corresponding to different sectors.
-    @expression(model, Qin_direct[i=1:graph.ndeg, n=1:param.N],  # Flow in the direction of the edge
-        max(1/(1+beta) * kappa_ex[i] * (Pjn[ee[i],n]/Pjn[es[i],n] - 1), 0)^(1/beta)
+    @expression(model, Qi_direct[i=1:graph.ndeg],  # Flow in the direction of the edge
+        maximum(((Pjn[ee[i],:]-Pjn[es[i],:]) ./ param.m) ./ ((1+beta) * PDj[es[i]] / kappa_ex[i]))^(1/beta)
     )
-    @expression(model, Qin_indirect[i=1:graph.ndeg, n=1:param.N], # Flow in edge opposite direction
-        max(1/(1+beta) * kappa_ex[i] * (Pjn[es[i],n]/Pjn[ee[i],n] - 1), 0)^(1/beta)
+    @expression(model, Qi_indirect[i=1:graph.ndeg], # Flow in edge opposite direction
+        maximum(((Pjn[es[i],:]-Pjn[ee[i],:]) ./ param.m) ./ ((1+beta) * PDj[ee[i]] / kappa_ex[i]))^(1/beta)
     )
-    # # -> Seems here we let the size of the flow decide the direction NOT NEEDED!
-    # @expression(model, Qin[i=1:graph.ndeg, n=1:param.N],
-    #     ifelse(Qin_direct[i,n] > Qin_indirect[i,n], Qin_direct[i,n], -Qin_indirect[i,n])
-    # )
+
+    B_direct = @expression(model, Apos * (Qi_direct .^ (1+beta) ./ kappa_ex))     # 1:J vector
+    B_indirect = @expression(model, Aneg * (Qi_indirect .^ (1+beta) ./ kappa_ex)) # 1:J vector
+    # Calculate consumption pre transport cost D(j,n)
+    @expression(model, Djn[j=1:graph.J, n=1:param.N], (Pjn[j, n] / zeta[j])^(-sigma) * (cj[j] * Lj[j] + B_direct[j] + B_indirect[j]))
+
     # Calculate labor allocation Ljn
     PZ = @expression(model, (Pjn .* Zjn) .^ (1/(1-a)))
     @expression(model, Ljn[j=1:graph.J, n=1:param.N],
@@ -69,15 +70,26 @@ function model_fixed_duality(optimizer, auxdata)
     )
     # Calculate production Yjn
     @expression(model, Yjn, Zjn .* Ljn .^ a)
-    # Create flow constraint expression
+    # # Create flow constraint expression
+    # @expression(model, cons[j=1:graph.J], # , n=1:param.N
+    #     sum(Djn[j,n] - Yjn[j,n] for n=1:param.N) + sum(A[j,i] * (Qi_direct[i] - Qi_indirect[i]) for i=1:graph.ndeg)
+    # )
+
+    # Better: add a 1:J constraint that satisfies the linear system, incorporating the flow constraint
+    # @constraint(model, A * (Qi_direct - Qi_indirect) - ((Yjn - Djn) .^ param.nu * param.m) .^ (1/param.nu) .<= -1e-8)
+
+    # Implicit definition 
+    # @expression(model, [i=1:graph.ndeg], Qi_direct[i] = sum(param.m[n] * Qin_direct[i,n]^param.nu for n=1:param.N)^(1/param.nu))
+    # @expression(model, [i=1:graph.ndeg], Qi_indirect[i] = sum(param.m[n] * Qin_indirect[i,n]^param.nu for n=1:param.N)^(1/param.nu))
+    # @expression(model, cons[j=1:graph.J, n=1:param.N],
+    #     Djn[j,n] - Yjn[j,n] + sum(A[j,i] * (Qin_direct[i,n] - Qin_indirect[i,n]) for i=1:graph.ndeg)
+    # )
+    @variable(model, Qin[1:graph.ndeg, 1:param.N], container=Array)
+    @constraint(model, [i=1:graph.ndeg], Qi_direct[i] - Qi_indirect[i] == sum(param.m[n] * Qin[i,n]^param.nu for n=1:param.N)^(1/param.nu))
     @expression(model, cons[j=1:graph.J, n=1:param.N],
-        Cjn[j,n] - Yjn[j,n] + sum(A[j,i] * (Qin_direct[i,n] - Qin_indirect[i,n]) + 
-            (Apos[j,i] * Qin_direct[i,n]^(1+beta) + Aneg[j,i] * Qin_indirect[i,n]^(1+beta)) / kappa_ex[i] for i=1:graph.ndeg)
-        # sum(A[j,i] * Qin_direct[i,n] for i=1:graph.ndeg) -
-        # sum(A[j,i] * Qin_indirect[i,n] for i=1:graph.ndeg) +
-        # sum(Apos[j,i] * Qin_direct[i,n]^(1+beta) / kappa_ex[i] for i=1:graph.ndeg) +
-        # sum(Aneg[j,i] * Qin_indirect[i,n]^(1+beta) / kappa_ex[i] for i=1:graph.ndeg)
+        Djn[j,n] - Yjn[j,n] + sum(A[j,i] * Qin[i, n] for i=1:graph.ndeg)
     )
+
     # Define the Lagrangian objective
     @expression(model, U, sum(omegaj .* Lj .* uj) - sum(Pjn .* cons))
     @objective(model, Min, U)
@@ -85,7 +97,7 @@ function model_fixed_duality(optimizer, auxdata)
     return model
 end
 
-function recover_allocation_fixed_duality(model, auxdata)
+function recover_allocation_fixed_duality_cgc(model, auxdata)
     param = auxdata.param
     graph = auxdata.graph
     model_dict = model.obj_dict
@@ -94,7 +106,8 @@ function recover_allocation_fixed_duality(model, auxdata)
     results[:welfare] = value(model_dict[:U])
     results[:Yjn] = value.(model_dict[:Yjn])
     results[:Yj] = dropdims(sum(results[:Yjn], dims=2), dims = 2)
-    results[:Cjn] = value.(model_dict[:Cjn])
+    results[:Djn] = value.(model_dict[:Djn]) 
+    results[:Dj] = dropdims(sum(results[:Djn], dims=2), dims = 2)
     results[:cj] = value.(model_dict[:cj])
     results[:Cj] = results[:cj] .* graph.Lj
     results[:Ljn] = value.(model_dict[:Ljn])
@@ -103,11 +116,9 @@ function recover_allocation_fixed_duality(model, auxdata)
     results[:uj] = value.(model_dict[:uj]) # param.u.(results[:cj], results[:hj])
     # Prices
     results[:Pjn] = value.(model_dict[:Pjn])
-    results[:PCj] = value.(model_dict[:PCj])  
+    results[:PCj] = dvalue.(model_dict[:PDj])
     # Network flows
-    Qin_direct = value.(model_dict[:Qin_direct])
-    Qin_indirect = value.(model_dict[:Qin_indirect])
-    results[:Qin] = ifelse.(Qin_direct .> Qin_indirect, Qin_direct, -Qin_indirect)
+    results[:Qin] = value.(model_dict[:Qin])
     results[:Qjkn] = gen_network_flows(results[:Qin], graph, param.N)
     return results
 end
